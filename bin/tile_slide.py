@@ -17,8 +17,9 @@ Options:
     -Q VALUE --quality=VALUE        For jpeg format, compression quality [default: 75]
     -s PIXEL --size=PIXEL           Tile size [default: 510]
     -e PIXEL --overlap=PIXEL        Number of extra pixels to add to each interior edge of a tile [default: 1]
-    -L --limit-bounds               Renders only non-empty slide region
+    -L --limit-bounds               Render only non-empty slide region
     -m LEVEL --magnification=LEVEL  Magnification level to use for tiling [default: 20.]
+    --size-cutoff=VALUE             Drop slides with dimension less than `size * cutoff %` [default: 75]
     -n --normalize                  Normalize staining (based on Macenko et al 2009)
     --heuristic=VALUE               Heuristics to estimate tissue coverage separated by comma.
                                     Possible values are: edge, dens.
@@ -58,11 +59,15 @@ def _check_option(option, argv, type_str, type_fun):
     return ans
 
 
-def main(dz, outdir, criteria=tuple(), normalize=None, tile_fmt='jpeg', jpeg_qual=75):
+def main(dz, outdir, criteria=tuple(), normalize=None,
+         tile_fmt='jpeg', jpeg_qual=75, size_tol=75):
     """Loop through and save tile images in outdir."""
-
+    assert 0 <= jpeg_qual <= 100, "JPEG quality must be between 0 and 100"
+    assert 0 <= size_tol <= 100, "Size tolerance must be between 0 and 100"
+    size_tol = dz.tile_size * size_tol / 100.
     os.makedirs(outdir, exist_ok=True)
     meta_file = os.path.join(outdir, "metadata.json")
+    # fields about the tiling process
     meta = {'tile_size':     dz.tile_size,
             'overlap':       dz.overlap,
             'bounds':        dz.limit_bounds,
@@ -92,6 +97,8 @@ def main(dz, outdir, criteria=tuple(), normalize=None, tile_fmt='jpeg', jpeg_qua
             filename = os.path.join(outdir, filename)
             # get tile meta
             px, py = tile.size  # size of tile
+            if px < size_tol or py < size_tol:
+                continue
             (x, y), lvl, (w, h) = dz.get_tile_coordinates(address)
             tile_stats = {'col': col, 'row': row,
                           'tile_width': px, 'tile_height': py,
@@ -128,6 +135,7 @@ if __name__ == '__main__':
     tile_size = _check_option('size',          argv, 'integer', int)
     tile_over = _check_option('overlap',       argv, 'integer', int)
     tile_zoom = _check_option('magnification', argv, 'float',   float)
+    size_tol  = _check_option('size-cutoff',   argv, 'float',   float)
     tile_limit = argv['--limit-bounds']
     normalize = argv['--normalize']
 
@@ -161,4 +169,7 @@ if __name__ == '__main__':
     dz = DeepZoomTiler(slide, tile_size=tile_size, overlap=tile_over,
                        limit_bounds=tile_limit, magnification=tile_zoom)
 
-    main(dz, outdir, criteria=criteria, normalize=normalize, tile_fmt=tile_fmt, jpeg_qual=jpeg_qual)
+    main(dz, outdir,
+         criteria=criteria, normalize=normalize,
+         tile_fmt=tile_fmt, jpeg_qual=jpeg_qual,
+         size_tol=size_tol)
