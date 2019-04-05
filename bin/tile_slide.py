@@ -25,7 +25,6 @@ Options:
     -b VALUE --beta=VALUE           Tissue coverage lower-cutoff separated by comma. Must be in [0,1)
 """
 import os
-import csv
 import json
 # from functools import partial  # to change parameters defaults
 
@@ -61,22 +60,32 @@ def _check_option(option, argv, type_str, type_fun):
 
 def main(dz, outdir, criteria=tuple(), normalize=None, tile_fmt='jpeg', jpeg_qual=75):
     """Loop through and save tile images in outdir."""
-    meta_file = os.path.join(outdir, "tile_metadata.csv")
-    meta_fields = ['col', 'row',                         # tile coordinates in grid
+
+    os.makedirs(outdir, exist_ok=True)
+    meta_file = os.path.join(outdir, "metadata.json")
+    meta = {'tile_size':     dz.tile_size,
+            'overlap':       dz.overlap,
+            'bounds':        dz.limit_bounds,
+            'grid_shape':    dz.shape,
+            'slide_dim':     dz.dimensions,
+            'magnification': dz.magnification,
+            'format':        tile_fmt,
+            'jpeg_qual':     jpeg_qual}
+
+    if normalize is None or not normalize:
+        norm = np.asarray  # does nothing
+        meta['normalize'] = None
+    else:
+        norm = normalize_staining
+        meta['normalize'] = 'Macenko'
+
+    tile_fields = ['col', 'row',                         # tile coordinates in grid
                    'tile_width', 'tile_height',          # tile dimensions
                    'slide_level', 'slide_x', 'slide_y',  # tile coordinates in slide
                    'slide_width', 'slide_height']        # tile dimensions in slide
-    meta_fields.extend(TILE_STATS.keys())
-
-    if callable(normalize):
-        norm = normalize
-    else:
-        norm = np.asarray  # does nothing
-
-    with open(meta_file, 'w+', newline='') as f:
-        # TODO: write json instead?
-        meta = csv.writer(f)
-        meta.writerow(meta_fields)
+    tile_fields.extend(TILE_STATS.keys())
+    meta['tiles'] = []
+    try:
         for address, tile in dz.itertiles():
             col, row = address
             filename = "{x}_{y}.{ext}".format(x=col, y=row, ext=tile_fmt)
@@ -96,7 +105,10 @@ def main(dz, outdir, criteria=tuple(), normalize=None, tile_fmt='jpeg', jpeg_qua
             tile = norm(tile)
             tile = Image.fromarray(tile)
             tile.save(filename, quality=jpeg_qual)
-            meta.writerow(tile_stats[field] for field in meta_fields)
+            meta['tiles'].append(tile_stats)
+    finally:
+        with open(meta_file, 'w') as fid:
+            json.dump(meta, fid)
 
 
 if __name__ == '__main__':
@@ -117,15 +129,9 @@ if __name__ == '__main__':
     tile_over = _check_option('overlap',       argv, 'integer', int)
     tile_zoom = _check_option('magnification', argv, 'float',   float)
     tile_limit = argv['--limit-bounds']
-
-    # Parse Normalization function
-    if argv['--normalize']:
-        normalize_fun = normalize_staining
-    else:
-        normalize_fun = None
+    normalize = argv['--normalize']
 
     # Setup inclusion criteria
-    # Parse Heuristic
     if argv['--heuristic'] is None:
         heuristics = ()
     else:
@@ -134,7 +140,6 @@ if __name__ == '__main__':
             if c not in TILE_STATS:
                 raise ValueError('Uknown heuristic `{}` specified'.format(c))
 
-    # Parse beta
     if argv['--beta'] is None:
         beta = ()
     else:
@@ -149,28 +154,11 @@ if __name__ == '__main__':
             "Number of betas does not much number of heuristics"
         assert all(0 <= b < 1 for b in beta), \
             "Some betas are not in the [0, 1) interval"
-
     criteria = tuple(zip(heuristics, beta))  # combine
 
     # Read Silde and Tile
     slide = OpenSlide(argv['<slide>'])
-
     dz = DeepZoomTiler(slide, tile_size=tile_size, overlap=tile_over,
                        limit_bounds=tile_limit, magnification=tile_zoom)
 
-    # write dz parameters to tiling_metadata.json
-    os.makedirs(outdir, exist_ok=True)
-    dz_meta = {'size':          dz.tile_size,
-               'overlap':       dz.overlap,
-               'bounds':        dz.limit_bounds,
-               'grid':          dz.shape,
-               'dimenions':     dz.dimensions,
-               'magnification': dz.magnification,
-               'normalize':     argv['--normalize'],
-               'tile_format':   tile_fmt,
-               'jpeg_qual':     jpeg_qual}
-    dz_meta_path = os.path.join(outdir, 'tiling_params.json')
-    with open(dz_meta_path, 'w') as fid:
-        json.dump(dz_meta, fid)
-
-    main(dz, outdir, criteria=criteria, normalize=normalize_fun, tile_fmt=tile_fmt, jpeg_qual=jpeg_qual)
+    main(dz, outdir, criteria=criteria, normalize=normalize, tile_fmt=tile_fmt, jpeg_qual=jpeg_qual)
