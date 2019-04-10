@@ -5,27 +5,42 @@ of histopathology (Aperio?) slides.
 import os
 import warnings
 import math
+import xml.etree.ElementTree as ET
+
 
 import openslide
 from openslide.deepzoom import DeepZoomGenerator
+from shapely.geometry import Polygon, box
+from shapely.ops import cascaded_union
+
+
+__all__ = ['OpenSlide', 'DeepZoomTiler']
 
 
 class OpenSlide(openslide.OpenSlide):
     """
-    Simple wrapper around openslide.OpenSlide.
+    Wrapper around openslide.OpenSlide.
 
-    It just remembers its input and stores the slide format.
-    (useful for debugging)
+    If slide annotation is provided in the form of xml file, it used to
+    populate the `self.annotation` list of annotations. Each annotation
+    has two main properties:
+    1. attrib: a dictionary of attributes
+    2. polygon: a shapely.geometry.Polygon used to define the region of
+                interest in terms of pixels.
     """
-
-    # TODO: add information about Region of Interest (ROI)
-    # see scratch/aperio_xml.py
 
     def __init__(self, filename, xml=None):
         """Initialize OpenSlide object."""
         super().__init__(filename)
         self._filename = os.path.abspath(filename)
         self._format = super().detect_format(filename)
+        mpp_x = self.properties[openslide.PROPERTY_NAME_MPP_X]
+        mpp_y = self.properties[openslide.PROPERTY_NAME_MPP_Y]
+        self._resolution = float(mpp_x), float(mpp_y)
+
+        self.annotations = []
+        if xml is not None:
+            self.parse_annotations(xml)
 
     @property
     def filename(self):
@@ -37,12 +52,37 @@ class OpenSlide(openslide.OpenSlide):
         """Return slide format."""
         return self._format
 
+    @property
+    def resolution(self):
+        """Microns per Pixel"""
+        return self._resolution
+
+    def parse_annotations(self, xml):
+        """
+        Parse slide annotation from xml file.
+
+        Annotations are appended to `self.annotations` as `ROIAnnotation` objects.
+
+        Parameters
+        ----------
+        str
+            path to an Aperio xml file with annotation data
+        """
+        tree = ET.parse(xml)
+        root = tree.getroot()
+        for annot in root.iterfind('./Annotation'):
+            self.annotations.append(ROIAnnotation(annot))
+
 
 class DeepZoomTiler(DeepZoomGenerator):
     """
     Wrapper aroudn openslide.deepzoom.DeepZoomGenerator.
 
-    Allows the user to select a tile level/magnification and iterate over the tiles.
+    Major differences compared to DeepZoomGenerator:
+        1. Has a default level attribute (`self.zoom_level`) for all
+           DeepZoomGenerator "get" functions.
+        2. Defines an iterator over tiles of any level (`self.itertiles`)
+        3. Can compute overlap of tiles with slide annotations
 
     DeepZoom format details
     -----------------------
@@ -52,8 +92,9 @@ class DeepZoomTiler(DeepZoomGenerator):
     The whole slide at the "objective resolution" is at the bottom of the pyramid
     (level=self.level_count) partitioned into slides of size `tile_size` in pixels.
     Each level doubles the magnification of the previous level.
-    See detailed descriptio here:
-    https://docs.microsoft.com/en-us/previous-versions/windows/silverlight/dotnet-windows-silverlight/cc645077(v=vs.95)
+    See detailed description:
+        - https://docs.microsoft.com/en-us/previous-versions/windows/silverlight/dotnet-windows-silverlight/cc645077(v=vs.95)
+        - https://ysbecca.github.io/programming/2018/05/22/py-wsi.html
     """
 
     def __init__(self, slide, tile_size=254, overlap=1, limit_bounds=False,
@@ -85,12 +126,11 @@ class DeepZoomTiler(DeepZoomGenerator):
             the grid shape for the current zoom level
         dimensions : (int, int)
             the slide dimentions (in pixels) for the current zoom level
-
-        Yields
-        ------
-        PIL.Image
-            tiles per row and column
-
+        annotations : dict of dict
+            outer keys are slide coordinates (x, y, level)
+            inner keys are slide annotation Names
+            inner values are tile overlap with corresponding annotation.
+            It's populated with calls to self.get_tile_annotation
         """
         if not isinstance(slide, openslide.OpenSlide):
             slide = OpenSlide(slide)
@@ -100,7 +140,7 @@ class DeepZoomTiler(DeepZoomGenerator):
             warnings.warn("For better viewer performance tile_size + 2*overlap"
                           "should be power of 2")
         # Memorize inputs
-        self.slide = slide  # TODO: is this necessary?
+        self.slide = slide
         self._tile_size = tile_size
         self._overlap = overlap
         self._limit_bounts = limit_bounds
@@ -118,6 +158,8 @@ class DeepZoomTiler(DeepZoomGenerator):
         self._level_magnification = tuple(level_magnification)
         if magnification is not None:
             self.magnification = magnification
+
+        self.annotations = {}
 
     @property
     def tile_size(self):
@@ -195,14 +237,31 @@ class DeepZoomTiler(DeepZoomGenerator):
 
         Returns
         -------
-        PIL.Image.Image
+        PIL.Image
             A pillow image of the tile
 
         """
-        # TODO: rewrite as __getitem__ ?
         if level is None:
             level = self.zoom_level
         return super().get_tile(level, address)
+
+    def __getitem__(self, address):
+        """
+        Return tile from address (x, y) in current zoom level.
+
+        Convienient wrapper around `self.get_tile(address, level)`.
+
+        Parameters
+        ----------
+        address : (int, int)
+            tuple of tile location on the grid. Format is (col, row)
+
+        Returns
+        -------
+        PIL.Image
+            A pillow image of the tile
+        """
+        return super().get_tile(self.zoom_level, address)
 
     def get_tile_coordinates(self, address, level=None):
         """
@@ -257,6 +316,42 @@ class DeepZoomTiler(DeepZoomGenerator):
             level = self.zoom_level
         return super().get_tile_dimensions(level, address)
 
+    def get_tile_annotation(self, address, level=None):
+        """
+        Return tile overlap with all the annotations of the slide.
+
+        The results are only computed the first time it's called on slide and
+        are stored in `self.annotations`. Successive calls just retrieved memorized outcome.
+
+        Parameters
+        ----------
+        address : (int, int)
+            tuple of tile location on the grid. Format is (col, row)
+        level : int
+            level of Deep Zoom pyramid. If not specified, self.zoom_level is used.
+
+        Returns
+        -------
+        dict:
+            keys: annotation Name or Id if Name is empty
+            value: overlaping area / total tile area
+        """
+        x, y = address
+        level = self.zoom_level if level is None else level
+        try:
+            return self.annotations[x, y, level]
+        except KeyError:
+            pass
+        (left, top), level, (width, height) = self.get_tile_coordinates(address, level)
+        right, bottom = left + width, top - height
+        tile = box(left, bottom, right, top)
+        overlaps = {}
+        for annot in self.slide.annotations:
+            key = annot.attrib['Name'] if annot.attrib['Name'] else annot.attrib['Id']
+            overlaps[key] = tile.intersection(annot.regions).area / tile.area
+        self.annotations[x, y, level] = overlaps
+        return overlaps
+
     def itertiles(self, level=None):
         """
         Iterate over the tiles of specified level (zoom_level if None).
@@ -272,6 +367,7 @@ class DeepZoomTiler(DeepZoomGenerator):
             a tuple of the tile address (col, row) and the tile as PIL.Image
 
         """
+        # TODO: re-implement using async
         cols, rows = self.shape
         level = self.zoom_level if level is None else level
         for col in range(cols):
@@ -279,6 +375,120 @@ class DeepZoomTiler(DeepZoomGenerator):
                 address = (col, row)
                 yield (address, super().get_tile(level, address))
 
-    # TODO: if slide has ROIs, compute overlap for tile and store in
-    # a dictionary of the form (lvl, col, row): (overlap_0, overlap_1, ...)
 
+class XmlNode:
+    _float_keys = ()
+    _bool_keys = ()
+    _int_keys = ()
+
+    def __init__(self, xmlnode):
+        self.attrib = self.parse_attributes(xmlnode)
+
+    def parse_attributes(self, node):
+        """
+        Convert region attributes to their natural type, based on educated guesses.
+        """
+        attrib = node.attrib
+        for key in self._float_keys:
+            try:
+                attrib[key] = float(attrib[key])
+            except KeyError:
+                pass
+
+        for key in self._int_keys:
+            try:
+                attrib[key] = int(attrib[key])
+            except KeyError:
+                pass
+
+        for key in self._bool_keys:
+            try:
+                attrib[key] = attrib[key] == '1'
+            except KeyError:
+                pass
+
+        return attrib
+
+
+class ROIAnnotation(XmlNode):
+    """
+    A class to store information from '/Annotations/Annotation node of Aperio xml files.
+
+    The class has 2 main attributes:
+        - `attrib` which is a dictionary of the actual xml attributes
+        - `regions` which is a `shapely` Polygon or MultiPolygon that defines
+           the regions of interest
+    """
+    _bool_keys = ('ReadOnly', 'NameReadOnly', 'Incremental',
+                  'LineColorReadOnly', 'Visible', 'Selected')
+
+    def __init__(self, xmlnode):
+        super().__init__(xmlnode)
+
+        # Redefine Name if Attribute is uniquely specified
+        attribute = xmlnode.findall('./Attributes/Attribute')
+        if len(attribute) == 1 and attribute[0].attrib['Name']:
+            if self.attrib['Name']:
+                warnings.warn('In the given xml, both "Annotation" and '
+                              '"Annotation/Attributes/Attribute" specify '
+                              'a "Name" attribute. The latter will be used '
+                              'but for no good reason')
+            self.attrib['Name'] = attribute[0].attrib['Name']
+        elif len(attribute) > 1:
+            warnings.warn('Multilple Annotation/Attributes were unexpectedly found.  '
+                          'All of them are ignored. Procceed at your own risk...')
+        # TODO: better warning messages
+
+        regions = [Region(n) for n in xmlnode.iterfind('./Regions/Region')]
+        self.regions = self._combine_regions(regions)
+
+    def __len__(self):
+        """Number of Regions"""
+        return len(self.regions)
+
+    def __repr__(self):
+        annotId = self.attrib['Id']
+        label = self.attrib['Name'] if self.attrib['Name'] else None
+        return "<ROIAnnotation {}:'{}' at {}>".format(annotId, label, id(self))
+
+    def _combine_regions(self, regions):
+        negative = [roi for roi in regions if roi.attrib['NegativeROA']]
+        positive = [roi for roi in regions if not roi.attrib['NegativeROA']]
+
+        for pos in positive:
+            for neg in negative:
+                # TODO: check negatives 'InputRegionId'?
+                if pos.polygon.intersects(neg.polygon):
+                    pos.polygon = pos.polygon - neg.polygon
+
+        return cascaded_union([pos.polygon for pos in positive])
+
+
+class Region(XmlNode):
+    _float_keys = ('Zoom', 'ImageFocus', 'Length', 'Area', 'LengthMicrons', 'AreaMicrons')
+    _bool_keys = ('Selected', 'NegativeROA', 'Analyze')
+
+    def __init__(self, xmlnode):
+        super().__init__(xmlnode)
+        self.polygon = self.parse_vertices(xmlnode)
+
+    def __len__(self):
+        """Number of vertices"""
+        return len(self.polygon.exterior.coords)
+
+    def __repr__(self):
+        rtype = 'Negative' if self.attrib['NegativeROA'] else 'Positive'
+        return '<{} Region at {}>'.format(rtype, id(self))
+
+    def parse_vertices(self, node):
+        # TODO: check whether these are absolute coord or depend on Zoom/ImageFocus
+        axes = ('X', 'Y', 'Z')
+        vertices = [tuple(int(v.attrib[k]) for k in axes)
+                    for v in node.iterfind('./Vertices/Vertex')]
+
+        if len(set(z for x, y, z in vertices)) > 1:
+            warnings.warn("3D slides are not supported yet. Z dimention will be ingored")
+
+        polygon = Polygon([(x, y) for x, y, z in vertices])
+
+        return polygon
